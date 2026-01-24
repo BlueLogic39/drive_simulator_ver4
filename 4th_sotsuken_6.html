@@ -1,0 +1,1056 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>three.js physics - rapier3d vehicle controller</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+		<link type="text/css" rel="stylesheet" href="main.css">
+		<style>
+			body {
+				color: #333;
+			}
+		</style>
+
+		<style>
+			.mono {
+				font-family: "Courier New", monospace;
+				display: inline-block;
+				min-width: 60px; /* 数字の揺れ防止 */
+				text-align: right;
+			}  /* 追加したもの */
+		</style>
+		
+	</head>
+	<body>
+
+		<div id="info">
+			<a href="https://threejs.org" target="_blank" rel="noopener">three.js</a> physics - <a href="https://github.com/dimforge/rapier.js" target="_blank">rapier</a> vehicle controller
+			<p>WASD or Arrow keys to move</p>
+			<p>Space to brake</p>
+   			<p>R to reset</p>
+		</div>
+
+
+		<div id="debug" style="position: absolute; top: 10px; right: 10px; background: #fff; padding: 10px; font-size: 14px; border-radius: 6px;">
+			Loading data...
+		</div>
+
+		
+
+		<script type="importmap">
+			{
+				"imports": {
+				  "three": "https://cdn.jsdelivr.net/npm/three@v0.177.0/build/three.module.js",
+				  "three/addons/": "https://cdn.jsdelivr.net/npm/three@v0.177.0/examples/jsm/"
+				}
+			}
+		</script>
+
+		<script type="module">
+
+			import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';//追加したもの
+
+			import * as THREE from 'three';
+			import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+			import { RapierPhysics } from 'three/addons/physics/RapierPhysics.js';
+			import { RapierHelper } from 'three/addons/helpers/RapierHelper.js';
+			import Stats from 'three/addons/libs/stats.module.js';
+
+			let prevHeight = null;
+			let heightDelta = 0;
+
+			let camera, scene, renderer, stats;
+
+			const startX = -1.5;
+			const startY = 1.5;
+			const startZ = -5;
+
+			let pointerControls;//追加したもの
+			let isFirstPerson = false;  // 一人称視点かどうかのフラグ　追加したもの
+			const driverCameraOffset = new THREE.Vector3(0.5, 0.5, -1.2); // 車体中心から運転席っぽい位置　追加したもの letからconstに変更
+
+			let physics, physicsHelper, controls;
+			let car, chassis, wheels, movement, vehicleController;
+
+
+			// ---------------- Sim Sensor Module (paste here) ----------------追加したもの
+			const AGG_MS_SIM = 100; // 0.1s 集計（スマホ版と合わせる）
+			let sim_rawLog = [];    // 生データ全部
+			let sim_aggBuffer = []; // バケットにためる
+			let sim_lastBucketTime = 0;
+			let sim_aggTimer = null;
+			let sim_recording = false;
+			let sim_startTime = 0;
+			let sim_prevVel = null; // THREE.Vector3 のコピー（前回サンプル時の速度）
+			const RAD2DEG = 180 / Math.PI;
+			const GRAVITY = new THREE.Vector3(0, -9.81, 0); //重力を追加したもの
+
+			// UI: debug element を使って右上パネルに切り替える
+			const simDebugEl = document.getElementById('debug');
+			if (simDebugEl) {
+			simDebugEl.innerHTML = `
+			<div id="simPanel" style="min-width:240px">
+				<div><b>Simulation Sensor</b></div>
+
+				<div id="simTime">time: 0.0 s</div>
+
+				<div>
+					accX: <span id="accX" class="mono">0.00</span>,
+					accY: <span id="accY" class="mono">0.00</span>,
+					accZ: <span id="accZ" class="mono">0.00</span> (m/s²)
+				</div>
+
+				<div>
+					rotA: <span id="rotA" class="mono">0.00</span>,
+					rotB: <span id="rotB" class="mono">0.00</span>,
+					rotC: <span id="rotC" class="mono">0.00</span> (deg/s)
+				</div>
+
+				<div>
+					speed: <span id="speedVal" class="mono">0.00</span> km/h
+				</div>
+
+				<div style="margin-top:6px">
+					<button id="simStartBtn">計測開始</button>
+					<button id="simStopBtn" disabled>停止</button>
+					<button id="simSaveBtn" disabled>CSV 保存</button>
+				</div>
+
+				<div id="simStatus" style="font-size:12px;color:#666;margin-top:6px">idle</div>
+			</div>
+		`;//追加したもの
+
+			// hook buttons
+			document.getElementById('simStartBtn').onclick = () => startSimRecording();
+			document.getElementById('simStopBtn').onclick  = () => stopSimRecording();
+			document.getElementById('simSaveBtn').onclick  = () => saveSimCSV();
+			}
+
+			// helper: deep copy velocity to store previous (THREE.Vector3)
+			function copyVel(vec) {
+			return new THREE.Vector3(vec.x, vec.y, vec.z);
+			}
+
+
+			///////////////////////////////////////////////////
+			// 0.1秒ごとのサンプル固定
+			const SIM_DT = AGG_MS_SIM / 1000;
+
+			// 0.1秒ごとに1回だけ記録するための状態
+			let sim_lastSampleBucket = null;
+			let sim_sampleIndex = 0; // 0.1秒刻みのカウンタ
+
+			// 表示/保存の丸め（エラー防止：round2 を先に定義しておく）
+			const round2 = (v) => Math.round(v * 100) / 100;
+
+			// Rapier RigidBody の回転(quat)を THREE Quaternion に変換
+			function getChassisQuatTHREE() {
+			const r = chassis.rotation(); // {x,y,z,w}
+			return new THREE.Quaternion(r.x, r.y, r.z, r.w);
+			}
+
+			// 車体の「右・前・上」軸（ワールド座標）を作る
+			function getCarAxesWorld() {
+			const q = getChassisQuatTHREE();
+
+			// あなたのコード上、車の「前」は (0,0,-1) を使っているので前軸はこれに合わせる
+			const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(q).normalize();
+			const right   = new THREE.Vector3(1, 0, 0).applyQuaternion(q).normalize();
+			const up      = new THREE.Vector3(0, 1, 0).applyQuaternion(q).normalize();
+
+			return { right, forward, up };
+			}
+
+			///////////////////////////////////////////////////
+
+			function sampleSimSensor() {
+			if (!sim_recording) return;
+			if (!chassis) return;
+
+			const now = performance.now();
+			const bucketKey = Math.floor(now / AGG_MS_SIM) * AGG_MS_SIM;
+
+			// ★同じ0.1秒区間で複数回記録しない
+			if (bucketKey === sim_lastSampleBucket) return;
+
+			// 初回
+			if (sim_lastSampleBucket === null) {
+				sim_lastSampleBucket = bucketKey;
+				sim_prevVel = null;
+				sim_sampleIndex = 0;
+			}
+
+			// Rapier 速度（ワールド座標）
+			const linVel = chassis.linvel ? chassis.linvel() : { x:0,y:0,z:0 };
+			const angVel = chassis.angvel ? chassis.angvel() : { x:0,y:0,z:0 };
+
+			const curVelW = new THREE.Vector3(linVel.x, linVel.y, linVel.z);
+
+			// dt は必ず 0.1 秒固定
+			const dt = AGG_MS_SIM / 1000;
+
+			// 並進加速度（ワールド座標）
+			let accWorld = new THREE.Vector3(0, 0, 0);
+			if (sim_prevVel) {
+				accWorld.copy(curVelW).sub(sim_prevVel).divideScalar(dt);
+			}
+
+			// ★スマホに合わせて重力込み（accelerationIncludingGravity相当）
+			const accIncludingG_World = accWorld.clone().add(GRAVITY);
+
+			// ===== ここが「スマホ軸合わせ」の本体 =====
+			// 車体の右・前・上（ワールド座標）を取得
+			const { right, forward, up } = getCarAxesWorld();
+
+			// スマホ定義に合わせて、車体軸へ射影
+			// X: 左右（右＋）
+			// Y: 前後（前＋）
+			// Z: 上下（上＋）
+			const accX = accIncludingG_World.dot(right);
+			const accY = accIncludingG_World.dot(forward);
+			const accZ = accIncludingG_World.dot(up);
+
+
+			// 角速度（ワールド）→ 車体軸へ → deg/s（スマホ定義に合わせる）
+			const angVelW = new THREE.Vector3(angVel.x || 0, angVel.y || 0, angVel.z || 0); // rad/s
+			// rotA: 前後の回転（pitch） +が後ろ回転（nose up） → 右軸まわり（そのままでOK）
+			const rotA = angVelW.dot(right) * RAD2DEG;
+			// rotB: 横の回転（roll） +が右回転 → 前軸まわり（そのままでOK）
+			const rotB = angVelW.dot(forward) * RAD2DEG;
+			// rotC: 水平の回転（yaw） +が左回転 → 上軸まわり「符号だけ反転」//追記　マイナス取った
+			const rotC = angVelW.dot(up) * RAD2DEG;
+
+
+			// speed（km/h）
+			const speed = curVelW.length() * 3.6;
+
+			// time（0.1秒刻み）
+			sim_sampleIndex += 1;
+			const time_s = sim_sampleIndex * 0.1;
+
+			const entry = {
+				time_s: Number(time_s.toFixed(1)),
+				accX: Number(accX.toFixed(2)),
+				accY: Number(accY.toFixed(2)),
+				accZ: Number(accZ.toFixed(2)),
+				rotA: Number(rotA.toFixed(2)),
+				rotB: Number(rotB.toFixed(2)),
+				rotC: Number(rotC.toFixed(2)),
+				speed_kmh: Number(speed.toFixed(2))
+			};
+
+			sim_rawLog.push(entry);
+
+			// UI更新
+			document.getElementById('simTime').innerText = `time: ${entry.time_s.toFixed(1)} s`;
+			document.getElementById("accX").innerText = entry.accX.toFixed(2);
+			document.getElementById("accY").innerText = entry.accY.toFixed(2);
+			document.getElementById("accZ").innerText = entry.accZ.toFixed(2);
+
+			document.getElementById("rotA").innerText = entry.rotA.toFixed(2);
+			document.getElementById("rotB").innerText = entry.rotB.toFixed(2);
+			document.getElementById("rotC").innerText = entry.rotC.toFixed(2);
+
+			document.getElementById("speedVal").innerText = entry.speed_kmh.toFixed(2);
+			document.getElementById('simStatus').innerText = `recording...`;
+
+			// 次回用
+			sim_prevVel = curVelW.clone();
+			sim_lastSampleBucket = bucketKey;
+			}
+
+
+
+			// average the entries in sim_aggBuffer and optionally keep a small display history (we don't draw graphs now)
+			function flushSimBucket(force = false) {
+			if (sim_aggBuffer.length === 0) {
+				if (force) {
+				// nothing to flush
+				}
+				return;
+			}
+			const n = sim_aggBuffer.length;
+			const sum = sim_aggBuffer.reduce((s, d) => {
+				s.accX += d.accX; s.accY += d.accY; s.accZ += d.accZ;
+				s.rotA += d.rotA; s.rotB += d.rotB; s.rotC += d.rotC;
+				s.speed += d.speed_kmh;
+				s.time_s += d.time_s;
+				return s;
+			}, {accX:0,accY:0,accZ:0,rotA:0,rotB:0,rotC:0,speed:0,time_s:0});
+
+			const avg = {
+				time_s: sum.time_s / n,
+				accX: sum.accX / n,
+				accY: sum.accY / n,
+				accZ: sum.accZ / n,
+				rotA: sum.rotA / n,
+				rotB: sum.rotB / n,
+				rotC: sum.rotC / n,
+				speed_kmh: sum.speed / n
+			};
+
+			// You can push averaged points to a separate array for later graphing if needed.
+			// clear buffer
+			sim_aggBuffer = [];
+			}
+
+			// start/stop/save functions
+			function startSimRecording() {
+			if (sim_recording) return;
+			sim_recording = true;
+			sim_rawLog = [];
+			sim_aggBuffer = [];
+			sim_lastBucketTime = 0;
+			sim_startTime = performance.now();
+			sim_prevVel = null;
+
+			sim_lastSampleBucket = null;//追加したもの
+			sim_sampleIndex = 0;//追加したもの
+
+			// safety timer to ensure bucket flushing even if animate's timing odd
+			if (!sim_aggTimer) sim_aggTimer = setInterval(() => {
+				// call a safe flush if time progressed
+				const nowKey = Math.floor(performance.now() / AGG_MS_SIM) * AGG_MS_SIM;
+				if (nowKey !== sim_lastBucketTime) {
+				flushSimBucket();
+				sim_lastBucketTime = nowKey;
+				}
+			}, AGG_MS_SIM + 10);
+
+			// enable stop/save button
+			const stopBtn = document.getElementById('simStopBtn');
+			const saveBtn = document.getElementById('simSaveBtn');
+			const startBtn = document.getElementById('simStartBtn');
+			if (stopBtn) stopBtn.disabled = false;
+			if (saveBtn) saveBtn.disabled = true;
+			if (startBtn) startBtn.disabled = true;
+			}
+
+			function stopSimRecording() {
+			if (!sim_recording) return;
+			sim_recording = false;
+			// final flush
+			flushSimBucket(true);
+			if (sim_aggTimer) { clearInterval(sim_aggTimer); sim_aggTimer = null; }
+			// update UI buttons
+			const stopBtn = document.getElementById('simStopBtn');
+			const saveBtn = document.getElementById('simSaveBtn');
+			const startBtn = document.getElementById('simStartBtn');
+			if (stopBtn) stopBtn.disabled = true;
+			if (saveBtn) saveBtn.disabled = false;
+			if (startBtn) startBtn.disabled = false;
+			if (document.getElementById('simStatus')) document.getElementById('simStatus').innerText = `stopped, ${sim_rawLog.length} samples`;
+			}
+
+			// CSV save — columns: time,accX,accY,accZ,rotA,rotB,rotC,speed_kmh
+			function saveSimCSV() {
+				if (sim_rawLog.length === 0) {
+					alert('No data to save');
+					return;
+				}
+
+				const rows = [];
+				rows.push('time,accX,accY,accZ,rotA,rotB,rotC,speed_kmh');
+
+				for (const r of sim_rawLog) {
+				rows.push(
+					`${Number(r.time_s).toFixed(1)},` +
+					`${Number(r.accX).toFixed(2)},${Number(r.accY).toFixed(2)},${Number(r.accZ).toFixed(2)},` +
+					`${Number(r.rotA).toFixed(2)},${Number(r.rotB).toFixed(2)},${Number(r.rotC).toFixed(2)},` +
+					`${Number(r.speed_kmh).toFixed(2)}`
+				);
+				}
+
+				const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+				const url = URL.createObjectURL(blob);
+				const a = document.createElement('a');
+				a.href = url;
+				a.download = 'simulation_sensor.csv';
+				a.click();
+			}
+			// ---------------- end Sim Sensor Module ----------------
+
+
+
+			init();
+
+			let ground; // ← ここで定義
+
+
+			// 交差点位置（例として「田」字の中心と十字路）
+			// 交差点の座標と、曲がれる方向(左、直進、右)を管理する
+			const intersections = [
+			{
+				position: new THREE.Vector3(0, 0, 0), // 田字の真ん中の交差点
+				turnOptions: ['left', 'straight', 'right']
+			},
+			{
+				position: new THREE.Vector3(-27, 0, 0),
+				turnOptions: ['straight'] // 例: 曲がれない、直進のみ
+			},
+			{
+				position: new THREE.Vector3(27, 0, 0),
+				turnOptions: ['straight']
+			},
+			{
+				position: new THREE.Vector3(0, 0, -27),
+				turnOptions: ['straight']
+			},
+			{
+				position: new THREE.Vector3(0, 0, 27),
+				turnOptions: ['straight']
+			}
+			];//追加したもの
+
+
+
+			async function init() {
+				scene = new THREE.Scene();
+				scene.background = new THREE.Color(0xbfd1e5);
+
+				camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+				camera.position.set(0, 4, 10);
+
+				pointerControls = new PointerLockControls(camera, document.body);//追加したもの
+
+				const ambient = new THREE.HemisphereLight( 0x555555, 0xFFFFFF );
+
+				scene.add( ambient );
+
+				const light = new THREE.DirectionalLight( 0xffffff, 4 );
+
+				light.position.set( 0, 12.5, 12.5 );
+				light.castShadow = true;
+				light.shadow.radius = 3;
+				light.shadow.blurSamples = 8;
+				light.shadow.mapSize.width = 2048;
+				light.shadow.mapSize.height = 2048;
+
+				const size = 40;
+				light.shadow.camera.left = - size;
+				light.shadow.camera.bottom = - size;
+				light.shadow.camera.right = size;
+				light.shadow.camera.top = size;
+				light.shadow.camera.near = 1;
+				light.shadow.camera.far = 50;
+
+				scene.add( light );
+			
+				renderer = new THREE.WebGLRenderer( { antialias: true } );
+				renderer.setPixelRatio( window.devicePixelRatio );
+				renderer.setSize( window.innerWidth, window.innerHeight );
+				renderer.shadowMap.enabled = true;
+				document.body.appendChild( renderer.domElement );
+				renderer.setAnimationLoop( animate );
+
+				controls = new OrbitControls( camera, renderer.domElement );
+
+				document.body.addEventListener('click', () => {
+					if (isFirstPerson) {
+						pointerControls.lock(); // 一人称視点のときだけマウスロック
+					}
+				});//追加したもの
+
+
+				controls.target = new THREE.Vector3( 0, 2, 0 );
+				controls.update();
+
+
+				stats = new Stats();
+				document.body.appendChild(stats.dom);//追加したもの
+
+				// RapierPhysicsを初期化
+				physics = await RapierPhysics();
+				physics.addScene(scene);
+
+				 // ===  ground を作成 ===
+				const size1 = 1200;
+				const segments = 200;
+
+				const geometry = new THREE.PlaneGeometry(size1, size1, segments, segments);
+				geometry.rotateX(-Math.PI / 2); // 平面を横にする
+
+				// 法線を再計算
+				geometry.computeVertexNormals();
+
+				const material = new THREE.MeshStandardMaterial({ color: 0xFFFFFF });
+				const ground = new THREE.Mesh(geometry, material);
+				ground.receiveShadow = true;
+
+				scene.add(ground);
+				//一旦コメントアウト　←外した
+
+				// 物理エンジン用コライダーを追加
+				//physics.addMesh(ground, 0); // ← ground はこの時点で定義済み！
+				// Rapier で静的な地面コライダーを作成
+				const groundColliderDesc = physics.RAPIER.ColliderDesc
+					.cuboid(size1 / 2, 0.1, size1 / 2) // 地面のサイズに合わせる
+					.setTranslation(0, 0, 0); // Y座標は必要に応じて変更（基本0でOK）
+
+				physics.world.createCollider(groundColliderDesc);
+				// 一旦コメントアウト　←外した
+
+
+				// ここから道路パーツの作成
+				// 直線道路
+				function createStraightRoad(length = 20, width = 6, pos = new THREE.Vector3(0, 0.05, 0), rotY = 0) {
+				const geometry = new THREE.BoxGeometry(width, 0.1, length);
+				const material = new THREE.MeshStandardMaterial({ color: 0x333333 });
+				const road = new THREE.Mesh(geometry, material);
+
+				road.position.copy(pos);
+				road.rotation.y = rotY;
+
+				physics.addMesh(road, 0);// 物理コライダー追加
+
+				return road;
+				}
+
+				// 直進 439m（ちょい余裕で 460m とかでもOK）
+				const straightMainLen = 460;
+				const straightMain = createStraightRoad(
+				straightMainLen,
+				6,
+				new THREE.Vector3(0, 0.05, -straightMainLen / 2) // 0〜-L をカバーする配置
+				);
+				scene.add(straightMain);
+
+				// ===== 左折後の2本目の道（L字の横道）を追加 =====
+				// 角（曲がり角）の座標：車線中心に合わせる（startX=-1.5 を踏襲）
+				const cornerX = -1.5;
+				const cornerZ = -440;      // 左折したい地点（調整OK）
+				const roadW = 6;
+
+				// 左折後の道の長さ（とりあえず 200m くらいでOK）
+				const secondLen = 200;
+
+				// 横道は X方向に伸ばしたいので rotY = Math.PI / 2
+				// ただし Box の中心座標で置く必要があるので、角から半分だけX方向へずらす
+				// 「-X方向へ進む左折」にしたいなら centerX は cornerX - secondLen/2
+				const secondRoad = createStraightRoad(
+				secondLen,
+				roadW,
+				new THREE.Vector3(cornerX - secondLen / 2, 0.05, cornerZ),
+				Math.PI / 2
+				);
+				scene.add(secondRoad);
+
+				// 曲がり角に“つなぎ”を置く（小さい四角）※段差/穴っぽさを消して安定する
+				const joint = createStraightRoad(
+				roadW,   // 長さ = 幅にして正方形
+				roadW,
+				new THREE.Vector3(cornerX, 0.05, cornerZ),
+				0
+				);
+				scene.add(joint);
+
+
+				
+
+				//車を作る
+				createCar();
+
+				// テクスチャを貼りたい場合（お好み） ２００×２００の１平方メートルのマスです
+				new THREE.TextureLoader().load('textures/grid.png', function(texture) {
+				texture.wrapS = THREE.RepeatWrapping;
+				texture.wrapT = THREE.RepeatWrapping;
+				texture.repeat.set(1200, 1200);
+				ground.material.map = texture;
+				ground.material.needsUpdate = true;
+				});
+			
+				//await initPhysics(); //必要ないらしい
+
+				// Movement input
+				movement = {
+					forward: 0,
+					right: 0,
+					brake: 0,
+					reset: false,
+					accelerateForce: { value: 0, min: -500, max: 500, step: 5 }, //加速度0.5
+					brakeForce: { value: 0, min: 0, max: 10, step: 0.75 }
+				};
+
+				window.addEventListener( 'keydown', ( event ) => {
+
+					//console.log( event.key );
+					if ( event.key === 'w' || event.key === 'ArrowUp' ) movement.forward = - 1;
+					if ( event.key === 's' || event.key === 'ArrowDown' ) movement.forward = 1;
+					if ( event.key === 'a' || event.key === 'ArrowLeft' ) movement.right = 1;
+					if ( event.key === 'd' || event.key === 'ArrowRight' ) movement.right = - 1;
+					if ( event.key === 'r' ) movement.reset = true;
+					if ( event.key === ' ' ) movement.brake = 1;
+
+
+					if (event.key === 'c') {
+						isFirstPerson = !isFirstPerson;
+
+						if (isFirstPerson) {
+							console.log("一人称視点モード");
+						} else {
+							console.log("通常視点モード");
+						}
+					}//追加したもの
+
+					if (event.key === 't') { // Tキーで自動運転ON/OFF
+					autoDriving = !autoDriving;
+					console.log(`自動運転: ${autoDriving ? 'ON' : 'OFF'}`);
+					if (!autoDriving) {
+						movement.forward = 0;
+						movement.right = 0;
+					}
+					}//追加したもの
+
+
+				} );
+
+				window.addEventListener( 'keyup', ( event ) => {
+
+					if ( event.key === 'w' || event.key === 's' || event.key === 'ArrowUp' || event.key === 'ArrowDown' ) movement.forward = 0;
+					if ( event.key === 'a' || event.key === 'd' || event.key === 'ArrowLeft' || event.key === 'ArrowRight' ) movement.right = 0;
+					if ( event.key === 'r' ) movement.reset = false;
+					if ( event.key === ' ' ) movement.brake = 0;
+			
+				} );
+
+				window.addEventListener( 'resize', onWindowResize, false );
+
+
+				// イベントなど後続処理
+				onWindowResize();
+
+			}
+
+
+			function isNearIntersection(carPosition, threshold = 2.5) {
+			for (const intersection of intersections) {
+				const dist = carPosition.distanceTo(intersection.position);
+				if (dist < threshold) {
+				return intersection;
+				}
+			}
+			return null;
+			}//追加したもの
+
+
+
+			function createCar( ) {
+
+				const geometry = new THREE.BoxGeometry( 1.7, 1.5, 4 );//車の大きさ
+				const material = new THREE.MeshStandardMaterial( { color: 0xFF0000 } );
+				const mesh = new THREE.Mesh( geometry, material );
+				mesh.castShadow = true;
+				scene.add( mesh );
+				car = mesh;
+
+				// ✅ ここで初期位置を設定
+				const startX = -1.5;
+				const startY = 1.5;
+				const startZ = -5;
+				mesh.position.set(startX, startY, startZ);
+
+				// --- Rapier RigidBody 作成 ---
+				const rigidBodyDesc = physics.RAPIER.RigidBodyDesc.dynamic()
+					.setTranslation(0, 5, 0); // 初期位置
+
+				const rigidBody = physics.world.createRigidBody(rigidBodyDesc);
+
+				// --- コライダー作成（重心オフセット設定） ---
+				const colliderDesc = physics.RAPIER.ColliderDesc.cuboid(1, 0.5, 2)
+					.setTranslation(0, -0.3, 0); // ← 重心を0.3m下げる例
+
+				physics.world.createCollider(colliderDesc, rigidBody);
+
+				// --- メッシュを剛体に紐づけ ---
+				mesh.userData.physics = { body: rigidBody };
+
+				// --- これまで使っていた chassis に代入 ---
+				chassis = rigidBody;
+
+				mesh.position.y = 1; // 重心が0.4mくらい
+
+				physics.addMesh(mesh, 1000, 0.8); //車の重量
+				chassis = mesh.userData.physics.body;
+
+				// ✅ ここでも物理ボディに初期位置を反映
+				chassis.setTranslation(new physics.RAPIER.Vector3(startX, startY, startZ), true);
+
+				vehicleController = physics.world.createVehicleController( chassis );
+
+				wheels = [];
+
+				addWheel(0, { x: -0.85, y: 0, z: -1.25 }, mesh);
+				addWheel(1, { x:  0.85, y: 0, z: -1.25 }, mesh);
+				addWheel(2, { x: -0.85, y: 0, z:  1.25 }, mesh);
+				addWheel(3, { x:  0.85, y: 0, z:  1.25 }, mesh);
+
+
+				vehicleController.setWheelSteering( 0, Math.PI / 4 );
+				vehicleController.setWheelSteering( 1, Math.PI / 4 );
+
+			}
+
+			function addWheel( index, pos, carMesh ) {
+
+				// Define wheel properties
+				const wheelRadius = 0.3;
+				const wheelWidth = 0.4;
+				const suspensionRestLength = 0.8;
+				const wheelPosition = pos; // Position relative to chassis
+				const wheelDirection = { x: 0.0, y: - 1.0, z: 0.0 }; // Downward direction
+				const wheelAxle = { x: - 1.0, y: 0.0, z: 0.0 }; // Axle direction
+
+				// Add the wheel to the vehicle controller
+				vehicleController.addWheel(
+					wheelPosition,
+					wheelDirection,
+					wheelAxle,
+					suspensionRestLength,
+					wheelRadius
+				);
+
+				// Set suspension stiffness for wheel
+				vehicleController.setWheelSuspensionStiffness( index, 24.0 );
+
+				// Set wheel friction
+				vehicleController.setWheelFrictionSlip( index, 1000.0 );
+
+				// Enable steering for the wheel
+				vehicleController.setWheelSteering( index, pos.z < 0 );
+
+				// Create a wheel mesh
+				const geometry = new THREE.CylinderGeometry( wheelRadius, wheelRadius, wheelWidth, 16 );
+				geometry.rotateZ( Math.PI * 0.5 );
+				const material = new THREE.MeshStandardMaterial( { color: 0x000000 } );
+				const wheel = new THREE.Mesh( geometry, material );
+
+				wheel.castShadow = true;
+
+				wheel.position.copy( pos );
+
+				wheels.push( wheel );
+				carMesh.add( wheel );
+
+			}
+
+			function updateWheels() {
+
+				if ( vehicleController === undefined ) return;
+
+				const wheelSteeringQuat = new THREE.Quaternion();
+				const wheelRotationQuat = new THREE.Quaternion();
+				const up = new THREE.Vector3( 0, 1, 0 );
+
+				//const chassisPosition = chassis.translation();
+
+				wheels.forEach( ( wheel, index ) => {
+
+					const wheelAxleCs = vehicleController.wheelAxleCs( index );
+					const connection = vehicleController.wheelChassisConnectionPointCs( index ).y || 0;
+					const suspension = vehicleController.wheelSuspensionLength( index ) || 0;
+					const steering = vehicleController.wheelSteering( index ) || 0;
+					const rotationRad = vehicleController.wheelRotation( index ) || 0;
+
+					wheel.position.y = connection - suspension;
+
+					wheelSteeringQuat.setFromAxisAngle( up, steering );
+					wheelRotationQuat.setFromAxisAngle( wheelAxleCs, rotationRad );
+
+					wheel.quaternion.multiplyQuaternions( wheelSteeringQuat, wheelRotationQuat );
+			
+				} );
+
+			}
+
+
+			//追加したもの
+			// ===== 速度・左折再現用 =====
+			let autoDriving = true;          // 再現する時だけ true（手動だけなら false）
+			const CRUISE_KMH = 45;           // 直線巡航（40〜50の間で調整）
+			const TURN_KMH   = 12.5;         // 左折時の目標速度（12〜13）
+			const SPEED_DEADBAND = 0.6;      // この範囲は許容（km/h）
+
+			// 左折を始める地点（今のコースに合わせて座標を置く）
+			const TURN_START = new THREE.Vector3(-1.5, 0, -440); // 例：あなたの既存値
+			// 左折の「減速開始」地点（左折地点より手前）
+			const SLOWDOWN_START = new THREE.Vector3(-1.5, 0, -400); // 例：5m手前（調整してOK）
+			const NEAR_THRESH = 3.0;         // “近い”判定の半径（m）
+
+			// 自動運転の段階管理
+			let autoPhase = "CRUISE";        // "CRUISE" → "SLOWDOWN" → "TURN" → "AFTER"
+			let turnStartYawDeg = null;
+			let targetYawDeg = null;
+
+			let turningStartYaw = null; // 曲がり開始時のヨー角  追加したもの
+			let targetYaw = null;       // 目指すヨー角  追加したもの
+
+
+			function getSpeedKmh() {
+			if (!chassis) return 0;
+			const v = chassis.linvel();
+			const speed = Math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
+			return speed * 3.6;
+			} //追加したもの
+
+			function applyTargetSpeed(targetKmh) {
+			if (!movement) return;          // movement がまだ無い時の保険
+			const sp = getSpeedKmh();
+			const err = targetKmh - sp;
+
+			// 目標より遅い → アクセル
+			if (err > SPEED_DEADBAND) {
+				movement.forward = -1;
+				movement.brake = 0;
+
+			// 目標より速い → ブレーキ
+			} else if (err < -SPEED_DEADBAND) {
+				movement.forward = 0;
+				movement.brake = 0.6;         // 強すぎたら 0.3 にしてOK
+
+			// だいたい合ってる → 惰性
+			} else {
+				movement.forward = 0;
+				movement.brake = 0;
+			}
+			}
+
+			function updateAutoDrive() {
+			if (!autoDriving || !car || !vehicleController) return;
+
+			// 車の位置（y無視）
+			const carPos = new THREE.Vector3();
+			car.getWorldPosition(carPos);
+			carPos.y = 0;
+
+			// 交差点手前判定
+			const distSlow = carPos.distanceTo(SLOWDOWN_START);
+			const distTurn = carPos.distanceTo(TURN_START);
+
+			// フェーズ遷移
+			if (autoPhase === "CRUISE" && distSlow < NEAR_THRESH) {
+				autoPhase = "SLOWDOWN";
+			}
+			if (autoPhase === "SLOWDOWN" && distTurn < NEAR_THRESH) {
+				autoPhase = "TURN";
+
+				// 曲がり開始のヨー角を保存して目標(+90°)を作る
+				const q = new THREE.Quaternion();
+				car.getWorldQuaternion(q);
+				const e = new THREE.Euler().setFromQuaternion(q, "YXZ");
+
+				turnStartYawDeg = THREE.MathUtils.radToDeg(e.y);
+
+				targetYawDeg = turnStartYawDeg + 90; // 左折なので +90
+				// -180〜180に正規化
+				targetYawDeg = ((targetYawDeg + 180) % 360) - 180;
+			}
+
+			// 各フェーズの制御
+			if (autoPhase === "CRUISE") {
+				applyTargetSpeed(CRUISE_KMH);
+				movement.right = 0;
+				return;
+			}
+
+			if (autoPhase === "SLOWDOWN") {
+				applyTargetSpeed(TURN_KMH);
+				movement.right = 0;
+				return;
+			}
+
+			if (autoPhase === "TURN") {
+				// 左折中は 12.5km/h を維持
+				applyTargetSpeed(TURN_KMH);
+
+				// 現在ヨー角
+				const q = new THREE.Quaternion();
+				car.getWorldQuaternion(q);
+				const e = new THREE.Euler().setFromQuaternion(q, "YXZ");
+				let yaw = THREE.MathUtils.radToDeg(e.y);
+
+				// ヨー角の差（-180〜180）
+				let diff = targetYawDeg - yaw;
+				diff = ((diff + 180) % 360) - 180;
+
+				// 差が大きいほど舵角を大きくする（比例制御）
+				// 0.02〜0.04くらいから試すのが安定
+				const Kp = 0.03;
+				let steer = THREE.MathUtils.clamp(diff * Kp, -1, 1);
+
+				// 左折なら基本 +（あなたの movement.right 定義に合わせて必要なら符号反転）
+				movement.right = steer;
+
+				// 目標に到達したら終了
+				if (Math.abs(diff) < 3) {
+				movement.right = 0;
+				autoPhase = "AFTER";
+				}
+				return;
+			}
+
+			if (autoPhase === "AFTER") {
+				// 左折後は巡航へ戻す
+				applyTargetSpeed(CRUISE_KMH);
+				movement.right = 0;
+				return;
+			}
+			}
+			//	追加したもの
+
+
+
+
+			function updateCarControl() {
+
+				if ( movement.reset ) {
+
+					chassis.setTranslation( new physics.RAPIER.Vector3(startX, startY, startZ), true );
+					chassis.setRotation( new physics.RAPIER.Quaternion( 0, 0, 0, 1 ), true );
+					chassis.setLinvel( new physics.RAPIER.Vector3( 0, 0, 0 ), true );
+					chassis.setAngvel( new physics.RAPIER.Vector3( 0, 0, 0 ), true );
+
+					movement.accelerateForce.value = 0;
+					movement.brakeForce.value = 0;
+
+					return;
+
+				}
+
+				let accelerateForce = 0;
+
+				if ( movement.forward < 0 ) {
+
+					//if (movement.accelerateForce.value === 0) chassis.wakeUp();
+					accelerateForce = movement.accelerateForce.value - movement.accelerateForce.step;
+					if ( accelerateForce < movement.accelerateForce.min ) accelerateForce = movement.accelerateForce.min;
+			
+				} else if ( movement.forward > 0 ) {
+
+					//if (movement.accelerateForce.value === 0) chassis.wakeUp();
+					accelerateForce = movement.accelerateForce.value + movement.accelerateForce.step;
+			
+					if ( accelerateForce > movement.accelerateForce.max ) accelerateForce = movement.accelerateForce.max;
+			
+				} else {
+
+					if ( chassis.isSleeping() ) chassis.wakeUp();
+
+				}
+
+				movement.accelerateForce.value = accelerateForce;
+
+				//console.log(accelerateForce);
+
+				let brakeForce = 0;
+
+				if ( movement.brake > 0 ) {
+			
+					brakeForce = movement.brakeForce.value + movement.brakeForce.step;
+					if ( brakeForce > movement.brakeForce.max ) brakeForce = movement.brakeForce.max;
+
+				}
+
+				movement.brakeForce.value = brakeForce;
+
+				const engineForce = accelerateForce;
+
+				vehicleController.setWheelEngineForce( 0, engineForce );
+				vehicleController.setWheelEngineForce( 1, engineForce );
+
+				const currentSteering = vehicleController.wheelSteering( 0 );
+				const steerDirection = movement.right;
+				const steerAngle = Math.PI / 4;
+
+				const steering = THREE.MathUtils.lerp( currentSteering, steerAngle * steerDirection, 0.25 );
+
+				vehicleController.setWheelSteering( 0, steering );
+				vehicleController.setWheelSteering( 1, steering );
+
+				const wheelBrake = movement.brake * brakeForce;
+				vehicleController.setWheelBrake( 0, wheelBrake );
+				vehicleController.setWheelBrake( 1, wheelBrake );
+				vehicleController.setWheelBrake( 2, wheelBrake );
+				vehicleController.setWheelBrake( 3, wheelBrake );
+
+			}
+
+			function onWindowResize( ) {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+
+				renderer.setSize( window.innerWidth, window.innerHeight );
+
+			}
+
+
+			function animate() {
+
+					if (vehicleController && movement) {
+					updateAutoDrive();
+					updateCarControl();
+					vehicleController.updateVehicle(1 / 60);
+					updateWheels();
+					}
+
+					sampleSimSensor();
+
+					if (car) {
+						const carWorldPos = new THREE.Vector3();
+						const carWorldQuat = new THREE.Quaternion();
+						car.getWorldPosition(carWorldPos);
+						car.getWorldQuaternion(carWorldQuat);
+
+						if (isFirstPerson) {
+							// 運転席位置を計算
+							const offset = driverCameraOffset.clone().applyQuaternion(carWorldQuat);
+							const cameraPos = carWorldPos.clone().add(offset);
+							camera.position.copy(cameraPos);
+
+							// 前方方向に target を置く
+							const front = new THREE.Vector3(0, 0, -1).applyQuaternion(carWorldQuat);
+							controls.target.copy(cameraPos.clone().add(front));
+						} else {
+							// 通常視点モード
+							controls.target.copy(car.position);
+						}
+
+						controls.update();
+					}
+
+					if (physicsHelper) physicsHelper.update();
+
+					renderer.render(scene, camera);
+
+					// デバッグ表示
+					if (chassis) {
+						const linVel = chassis.linvel();
+						const angVel = chassis.angvel();
+						const rotation = chassis.rotation();
+
+						const speed = Math.sqrt(linVel.x ** 2 + linVel.y ** 2 + linVel.z ** 2);
+    					const speedKmh = speed * 3.6;
+
+						const rotEuler = new THREE.Euler().setFromQuaternion(
+							new THREE.Quaternion(rotation.x, rotation.y, rotation.z, rotation.w),
+							'YXZ'
+						);
+						const pitch = rotEuler.x * (180 / Math.PI);
+						const roll = rotEuler.z * (180 / Math.PI);
+
+						const chassisTranslation = chassis.translation();
+						const currentHeight = chassisTranslation.y;
+
+						if (prevHeight !== null) {
+							heightDelta = currentHeight - prevHeight;
+						}
+						prevHeight = currentHeight;//追加したもの
+					}
+
+					if (stats) stats.update();  //変更したもの
+
+				}
+
+		</script>
+	</body>
+</html>
