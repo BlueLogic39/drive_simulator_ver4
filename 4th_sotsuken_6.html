@@ -507,10 +507,10 @@
 				}
 
 				// 直進 439m（ちょい余裕で 460m とかでもOK）
-				const straightMainLen = 460;
+				const straightMainLen = 520;
 				const straightMain = createStraightRoad(
 				straightMainLen,
-				6,
+				8,
 				new THREE.Vector3(0, 0.05, -straightMainLen / 2) // 0〜-L をカバーする配置
 				);
 				scene.add(straightMain);
@@ -518,8 +518,8 @@
 				// ===== 左折後の2本目の道（L字の横道）を追加 =====
 				// 角（曲がり角）の座標：車線中心に合わせる（startX=-1.5 を踏襲）
 				const cornerX = -1.5;
-				const cornerZ = -440;      // 左折したい地点（調整OK）
-				const roadW = 6;
+				const cornerZ = -458;      // 左折したい地点（調整OK）
+				const roadW = 8;
 
 				// 左折後の道の長さ（とりあえず 200m くらいでOK）
 				const secondLen = 200;
@@ -814,6 +814,21 @@
 			}
 			}
 
+			// ===== 解決策A：6秒カーブ制御用 =====
+			const TURN_TIME_MS = 8000; // カーブ時間（実車: 約6秒）
+			let turnStartTimeMs = 0;   // TURN開始時刻
+			let turnStartYawDegAbs = 0; // TURN開始時のヨー角（deg）
+			function normDeg180(d) {
+			// 角度を -180〜180 に正規化
+			return ((d + 180) % 360) - 180;
+			}
+			function easeInOutCubic(t) {
+			// 0→1 の進捗を「最初ゆっくり→途中速い→最後ゆっくり」にする
+			return t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
+			}
+			// ===== 解決策A：6秒カーブ制御用 ===== 1/30 追加したもの
+
+
 			function updateAutoDrive() {
 			if (!autoDriving || !car || !vehicleController) return;
 
@@ -831,18 +846,22 @@
 				autoPhase = "SLOWDOWN";
 			}
 			if (autoPhase === "SLOWDOWN" && distTurn < NEAR_THRESH) {
-				autoPhase = "TURN";
+			autoPhase = "TURN";
 
-				// 曲がり開始のヨー角を保存して目標(+90°)を作る
-				const q = new THREE.Quaternion();
-				car.getWorldQuaternion(q);
-				const e = new THREE.Euler().setFromQuaternion(q, "YXZ");
+			// TURN開始時のヨー角を保存
+			const q = new THREE.Quaternion();
+			car.getWorldQuaternion(q);
+			const e = new THREE.Euler().setFromQuaternion(q, "YXZ");
+			turnStartYawDegAbs = THREE.MathUtils.radToDeg(e.y);
 
-				turnStartYawDeg = THREE.MathUtils.radToDeg(e.y);
+			// 6秒カーブ用タイマー開始
+			turnStartTimeMs = performance.now();
 
-				targetYawDeg = turnStartYawDeg + 90; // 左折なので +90
-				// -180〜180に正規化
-				targetYawDeg = ((targetYawDeg + 180) % 360) - 180;
+			// 目標角（左折なら +90°）
+			targetYawDeg = normDeg180(turnStartYawDegAbs + 90);
+
+			// 念のため：最初の舵をゼロに
+			movement.right = 0;
 			}
 
 			// 各フェーズの制御
@@ -859,31 +878,39 @@
 			}
 
 			if (autoPhase === "TURN") {
-				// 左折中は 12.5km/h を維持
+				// 左折中は低速を維持
 				applyTargetSpeed(TURN_KMH);
+
+				// 進捗（0→1）
+				const t = (performance.now() - turnStartTimeMs) / TURN_TIME_MS;
+				const p = Math.min(Math.max(t, 0), 1);        // 0〜1にクランプ
+				const pe = easeInOutCubic(p);                 // イージング
+
+				// 「この時点であるべき目標ヨー角」を作る（6秒で90°）
+				const desiredYaw = normDeg180(
+					turnStartYawDegAbs + (targetYawDeg - turnStartYawDegAbs) * pe
+				);
 
 				// 現在ヨー角
 				const q = new THREE.Quaternion();
 				car.getWorldQuaternion(q);
 				const e = new THREE.Euler().setFromQuaternion(q, "YXZ");
-				let yaw = THREE.MathUtils.radToDeg(e.y);
+				const yaw = THREE.MathUtils.radToDeg(e.y);
 
-				// ヨー角の差（-180〜180）
-				let diff = targetYawDeg - yaw;
-				diff = ((diff + 180) % 360) - 180;
+				// 誤差（-180〜180）
+				let diff = normDeg180(desiredYaw - yaw);
 
-				// 差が大きいほど舵角を大きくする（比例制御）
-				// 0.02〜0.04くらいから試すのが安定
-				const Kp = 0.03;
-				let steer = THREE.MathUtils.clamp(diff * Kp, -1, 1);
+				// 舵角（比例制御：弱めにして急を抑える）
+				const Kp = 0.02;
+				let steerCmd = THREE.MathUtils.clamp(diff * Kp, -1, 1);
 
-				// 左折なら基本 +（あなたの movement.right 定義に合わせて必要なら符号反転）
-				movement.right = steer;
+				// ★舵入力をさらに滑らかに（急な立ち上がり対策）
+				movement.right = THREE.MathUtils.lerp(movement.right, steerCmd, 0.06);
 
-				// 目標に到達したら終了
-				if (Math.abs(diff) < 3) {
-				movement.right = 0;
-				autoPhase = "AFTER";
+				// 6秒終わったら終了
+				if (p >= 1) {
+					movement.right = 0;
+					autoPhase = "AFTER";
 				}
 				return;
 			}
@@ -911,6 +938,12 @@
 
 					movement.accelerateForce.value = 0;
 					movement.brakeForce.value = 0;
+
+					autoPhase = "CRUISE";
+					turnStartTimeMs = 0;
+					turnStartYawDegAbs = 0;
+					targetYawDeg = null;
+					movement.right = 0;
 
 					return;
 
@@ -959,9 +992,11 @@
 
 				const currentSteering = vehicleController.wheelSteering( 0 );
 				const steerDirection = movement.right;
-				const steerAngle = Math.PI / 4;
+				const steerAngle = Math.PI / 7; //変更したもの
 
-				const steering = THREE.MathUtils.lerp( currentSteering, steerAngle * steerDirection, 0.25 );
+				const STEER_LERP = 0.10; // 0.05〜0.10で調整 変更したもの
+				const steering = THREE.MathUtils.lerp(currentSteering, steerAngle * steerDirection, STEER_LERP);
+
 
 				vehicleController.setWheelSteering( 0, steering );
 				vehicleController.setWheelSteering( 1, steering );
