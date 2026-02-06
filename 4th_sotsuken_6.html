@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 	<head>
@@ -510,19 +511,19 @@
 				const straightMainLen = 520;
 				const straightMain = createStraightRoad(
 				straightMainLen,
-				8,
-				new THREE.Vector3(0, 0.05, -straightMainLen / 2) // 0〜-L をカバーする配置
+				16,
+				new THREE.Vector3(3, 0.05, -straightMainLen / 2) // 0〜-L をカバーする配置
 				);
 				scene.add(straightMain);
 
 				// ===== 左折後の2本目の道（L字の横道）を追加 =====
 				// 角（曲がり角）の座標：車線中心に合わせる（startX=-1.5 を踏襲）
 				const cornerX = -1.5;
-				const cornerZ = -458;      // 左折したい地点（調整OK）
-				const roadW = 8;
+				const cornerZ = -462;      // 左折したい地点（調整OK）
+				const roadW = 16;
 
 				// 左折後の道の長さ（とりあえず 200m くらいでOK）
-				const secondLen = 200;
+				const secondLen = 250;
 
 				// 横道は X方向に伸ばしたいので rotY = Math.PI / 2
 				// ただし Box の中心座標で置く必要があるので、角から半分だけX方向へずらす
